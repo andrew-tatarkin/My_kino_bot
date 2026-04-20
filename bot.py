@@ -2,14 +2,16 @@ import telebot
 import sqlite3
 import logging
 import os
+import threading
 from dotenv import load_dotenv
 from telebot import types
+from flask import Flask
 from telebot.handler_backends import State, StatesGroup
 from telebot.storage import StateMemoryStorage
 from telebot import custom_filters
 
 
-# ==================== Flask для healthcheck ====================
+# ==================== Flask app ====================
 app = Flask(__name__)
 
 @app.route('/')
@@ -20,19 +22,20 @@ def home():
 def health():
     return "OK", 200
 
-# ==================== ТОКЕН ====================
+# ==================== Загрузка токена ====================
 load_dotenv()
 
 TOKEN = os.getenv('TOKEN')
-
 if not TOKEN:
-    raise ValueError("❌ TOKEN не найден!")
+    raise ValueError("❌ TOKEN не найден! Проверь Environment Variables на Render.")
 
 logging.basicConfig(level=logging.INFO)
 
 state_storage = StateMemoryStorage()
 bot = telebot.TeleBot(TOKEN, state_storage=state_storage)
 bot.add_custom_filter(custom_filters.StateFilter(bot))
+
+print("✅ Бот инициализирован успешно")
 
 
 # ==================== Запуск ====================
