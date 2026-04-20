@@ -40,7 +40,7 @@ print("✅ Бот инициализирован успешно")
 
 # ==================== Запуск ====================
 if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 10000))sssssss
+    port = int(os.environ.get('PORT', 10000))
     print(f"🌐 Запуск Flask healthcheck на порту {port}")
     
     # Запускаем Flask в отдельном потоке
