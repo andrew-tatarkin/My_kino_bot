@@ -10,7 +10,7 @@ load_dotenv()
 
 TOKEN = os.getenv('TOKEN')
 if not TOKEN:
-    raise ValueError("❌ TOKEN не найден! Добавь его в Environment Variables на Render.")
+    raise ValueError("❌ TOKEN не найден!")
 
 bot = telebot.TeleBot(TOKEN)
 storage = StateMemoryStorage()
@@ -25,27 +25,31 @@ admin_users = set()
 def init_db():
     conn = sqlite3.connect('movies.db')
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS movies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        category TEXT NOT NULL,
-        rating REAL,
-        poster TEXT,
-        description TEXT,
-        added_by INTEGER,
-        user_rating REAL,
-        admin_rating REAL
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS suggestions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        category TEXT,
-        rating REAL,
-        poster TEXT,
-        description TEXT,
-        suggested_by INTEGER,
-        status TEXT DEFAULT 'pending'
-    )''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS movies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL,
+            rating REAL,
+            poster TEXT,
+            description TEXT,
+            added_by INTEGER,
+            user_rating REAL,
+            admin_rating REAL
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            category TEXT,
+            rating REAL,
+            poster TEXT,
+            description TEXT,
+            suggested_by INTEGER,
+            status TEXT DEFAULT 'pending'
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -82,17 +86,18 @@ def is_admin(user_id):
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.delete_state(message.from_user.id, message.chat.id)
-    await message.answer(
-        "👋 Добро пожаловать!\n\n"
-        f"Пароль админа: `{ADMIN_PASSWORD}`",
-        parse_mode='Markdown',
-        reply_markup=get_main_menu(is_admin(message.from_user.id))
-    )
+    is_adm = is_admin(message.from_user.id)
+    
+    bot.send_message(message.chat.id, 
+        "👋 Добро пожаловать в кино-трекер!\n\n"
+        f"Чтобы стать админом — введи пароль: `{ADMIN_PASSWORD}`", 
+        parse_mode='Markdown')
+    bot.send_message(message.chat.id, "Выбери действие:", reply_markup=get_main_menu(is_adm))
 
-print("✅ Бот запущен")
+print("✅ Бот инициализирован успешно")
 
 # ==================== Запуск  ====================
 if __name__ == "__main__":
-    bot.remove_webhook()   # на всякий случай
-    print("🚀 Запуск polling...")
+    bot.remove_webhook()
+    print("🚀 Бот запущен и ожидает сообщений...")
     bot.infinity_polling(none_stop=True, interval=1, timeout=30)
