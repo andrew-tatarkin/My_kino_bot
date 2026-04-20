@@ -1,18 +1,25 @@
 import telebot
 import sqlite3
 import logging
+import os
+from dotenv import load_dotenv
 from telebot import types
 from telebot.handler_backends import State, StatesGroup
 from telebot.storage import StateMemoryStorage
 from telebot import custom_filters
 
-logging.basicConfig(level=logging.INFO)
 # ==================== ТОКЕН ====================
-TOKEN = '8775322037:AAFZf5mnmdmTEmMh-awi5xlqc60-poR1gz8'
+load_dotenv()
+
+TOKEN = os.getenv('TOKEN')
+
+if not TOKEN:
+    raise ValueError("❌ TOKEN не найден!")
+
+logging.basicConfig(level=logging.INFO)
 
 state_storage = StateMemoryStorage()
 bot = telebot.TeleBot(TOKEN, state_storage=state_storage)
-
 bot.add_custom_filter(custom_filters.StateFilter(bot))
 
 
