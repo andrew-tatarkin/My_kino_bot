@@ -15,7 +15,7 @@ import aiosqlite
 load_dotenv()
 
 # ==================== Глобальные переменные ====================
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '0000')
 admin_users = set()
 TOKEN = os.getenv('TOKEN')
 
