@@ -8,6 +8,18 @@ from telebot.handler_backends import State, StatesGroup
 from telebot.storage import StateMemoryStorage
 from telebot import custom_filters
 
+
+# ==================== Flask для healthcheck ====================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Бот работает! ✅"
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
 # ==================== ТОКЕН ====================
 load_dotenv()
 
@@ -22,6 +34,20 @@ state_storage = StateMemoryStorage()
 bot = telebot.TeleBot(TOKEN, state_storage=state_storage)
 bot.add_custom_filter(custom_filters.StateFilter(bot))
 
+
+# ==================== Запуск ====================
+def run_bot():
+    print("🤖 Telegram бот запущен...")
+    bot.infinity_polling(none_stop=True, interval=1)
+
+if __name__ == "__main__":
+    bot_thread = threading.Thread(target=run_bot, daemon=True)  # Запускаем бота в отдельном потоке
+    bot_thread.start()
+
+    # Запускаем Flask сервер 
+    port = int(os.environ.get('PORT', 10000))
+    print(f"🌐 Flask сервер запущен на порту {port}")
+    app.run(host='0.0.0.0', port=port)
 
 # ==================== СОСТОЯНИЯ (FSM) ====================
 class SuggestionStates(StatesGroup):
