@@ -1,2 +1,3 @@
-pyTelegramBotAPI==4.22.1
+aiogram==3.8.0
+aiosqlite
 python-dotenv
