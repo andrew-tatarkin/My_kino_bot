@@ -40,25 +40,25 @@ print("✅ Бот инициализирован успешно")
 
 
 # ==================== Запуск ====================
-if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 10000))
-    print(f"🌐 Запуск Flask healthcheck на порту {port}")
+# if __name__ == "__main__":
+#     port = int(os.environ.get('PORT', 10000))
+#     print(f"🌐 Запуск Flask healthcheck на порту {port}")
 
-    # Запускаем Flask
-    from threading import Thread
-    flask_thread = Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False))
-    flask_thread.daemon = True
-    flask_thread.start()
+#     # Запускаем Flask
+#     from threading import Thread
+#     flask_thread = Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False))
+#     flask_thread.daemon = True
+#     flask_thread.start()
 
-    print("🤖 Запуск Telegram бота...")
+#     print("🤖 Запуск Telegram бота...")
 
-    import time
-    time.sleep(3)  # даём Flask время запуститься
+#     import time
+#     time.sleep(3)  # даём Flask время запуститься
 
-    try:
-        bot.infinity_polling(none_stop=True, interval=1, timeout=30, long_polling_timeout=30)
-    except Exception as e:
-        print(f"❌ Ошибка polling: {e}")
+#     try:
+#         bot.infinity_polling(none_stop=True, interval=1, timeout=30, long_polling_timeout=30)
+#     except Exception as e:
+#         print(f"❌ Ошибка polling: {e}")
 
 # ==================== СОСТОЯНИЯ (FSM) =================== =
 class SuggestionStates(StatesGroup):
