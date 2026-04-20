@@ -39,18 +39,18 @@ print("✅ Бот инициализирован успешно")
 
 
 # ==================== Запуск ====================
-def run_bot():
-    print("🤖 Telegram бот запущен...")
-    bot.infinity_polling(none_stop=True, interval=1)
-
 if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot, daemon=True)  # Запускаем бота в отдельном потоке
-    bot_thread.start()
-
-    # Запускаем Flask сервер 
     port = int(os.environ.get('PORT', 10000))
-    print(f"🌐 Flask сервер запущен на порту {port}")
-    app.run(host='0.0.0.0', port=port)
+    print(f"🌐 Запуск Flask healthcheck на порту {port}")
+    
+    # Запускаем Flask в отдельном потоке
+    from threading import Thread
+    flask_thread = Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False))
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    print("🤖 Запуск Telegram бота... ")
+    bot.infinity_polling(none_stop=True, interval=1, timeout=20)
 
 # ==================== СОСТОЯНИЯ (FSM) ====================
 class SuggestionStates(StatesGroup):
