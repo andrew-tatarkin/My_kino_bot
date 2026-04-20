@@ -1,66 +1,63 @@
-import telebot
-import sqlite3
-import logging
 import os
-import threading
-import time
+import logging
+import asyncio
 from dotenv import load_dotenv
-from telebot import types
-from flask import Flask
-from telebot.handler_backends import State, StatesGroup
-from telebot.storage import StateMemoryStorage
-from telebot import custom_filters
 
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-# ==================== Flask app ====================
-app = Flask(__name__)
+import aiosqlite
 
-@app.route('/')
-def home():
-    return "Бот работает! ✅"
-
-@app.route('/health')
-def health():
-    return "OK", 200
-
-# ==================== Загрузка токена ====================
 load_dotenv()
 
+# ==================== Глобальные переменные ====================
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
+admin_users = set()
 TOKEN = os.getenv('TOKEN')
+
 if not TOKEN:
-    raise ValueError("❌ TOKEN не найден! Проверь Environment Variables на Render.")
+    raise ValueError("❌ TOKEN не найден в .env файле!")
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
 logging.basicConfig(level=logging.INFO)
 
-state_storage = StateMemoryStorage()
-bot = telebot.TeleBot(TOKEN, state_storage=state_storage)
-bot.add_custom_filter(custom_filters.StateFilter(bot))
+# ==================== База данных ====================
+async def init_db():
+    async with aiosqlite.connect('movies.db') as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS movies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                rating REAL,
+                poster TEXT,
+                description TEXT,
+                added_by INTEGER,
+                user_rating REAL,
+                admin_rating REAL
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                category TEXT,
+                rating REAL,
+                poster TEXT,
+                description TEXT,
+                suggested_by INTEGER,
+                status TEXT DEFAULT 'pending'
+            )
+        ''')
+        await db.commit()
 
-print("✅ Бот инициализирован успешно")
-
-
-# ==================== Запуск ====================
-# if __name__ == "__main__":
-#     port = int(os.environ.get('PORT', 10000))
-#     print(f"🌐 Запуск Flask healthcheck на порту {port}")
-
-#     # Запускаем Flask
-#     from threading import Thread
-#     flask_thread = Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False))
-#     flask_thread.daemon = True
-#     flask_thread.start()
-
-#     print("🤖 Запуск Telegram бота...")
-
-#     import time
-#     time.sleep(3)  # даём Flask время запуститься
-
-#     try:
-#         bot.infinity_polling(none_stop=True, interval=1, timeout=30, long_polling_timeout=30)
-#     except Exception as e:
-#         print(f"❌ Ошибка polling: {e}")
-
-# ==================== СОСТОЯНИЯ (FSM) =================== =
+# ==================== Состояния ====================
 class SuggestionStates(StatesGroup):
     waiting_title = State()
     waiting_category = State()
@@ -75,429 +72,168 @@ class ApproveStates(StatesGroup):
 class DeleteStates(StatesGroup):
     waiting_delete_confirm = State()
 
-# ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
-ADMIN_PASSWORD = "0000"
-admin_users = set()   # сюда буду добавлять user_id тех, кто ввёл правильный пароль
-
-# ==================== БАЗА ДАННЫХ ====================
-def init_db():
-    conn = sqlite3.connect('movies.db')
-    cursor = conn.cursor()
-    
-       # Таблица утверждённых фильмов
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS movies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            category TEXT NOT NULL,
-            rating REAL,                    -- средняя/финальная оценка (для совместимости)
-            poster TEXT,
-            description TEXT,
-            added_by INTEGER,
-            added_date TEXT DEFAULT CURRENT_TIMESTAMP,
-            user_rating REAL,               -- оценка от пользователя
-            admin_rating REAL               -- оценка как админа
-        )
-    ''')
-    
-    # Таблица предложений (ожидают одобрения)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS suggestions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            category TEXT,
-            rating REAL,                    -- оценка того, кто предложил
-            poster TEXT,
-            description TEXT,
-            suggested_by INTEGER NOT NULL,  -- user_id предложившего
-            suggested_date TEXT DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'pending'   -- pending / approved / rejected
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-# Инициализируем базу при запуске
-init_db()
-
-
-# ==================== ГЛАВНОЕ МЕНЮ ====================
-def get_main_menu(is_admin=False):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add('📽 Предложить фильм', '🎲 Случайный фильм')
-    markup.add('📋 Посмотреть фильмы')
-    
+# ==================== Главное меню ====================
+def get_main_menu(is_admin: bool = False):
+    kb = [
+        [KeyboardButton(text="📽 Предложить фильм"), KeyboardButton(text="🎲 Случайный фильм")],
+        [KeyboardButton(text="📋 Посмотреть фильмы")]
+    ]
     if is_admin:
-        markup.add('🔧 Админ-панель', '🗑 Удалить фильм')
-    return markup
+        kb.append([KeyboardButton(text="🔧 Админ-панель"), KeyboardButton(text="🗑 Удалить фильм")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-def is_admin(user_id):
+def is_admin(user_id: int) -> bool:
     return user_id in admin_users
 
-# ==================== СТАРТ ====================
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.delete_state(message.from_user.id, message.chat.id)
-    is_adm = is_admin(message.from_user.id)
-    
-    bot.send_message(message.chat.id, 
+# ==================== Старт ====================
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
         "👋 Добро пожаловать в кино-трекер!\n\n"
         "По умолчанию ты в режиме пользователя.\n"
-        f"Чтобы стать админом — введи пароль: `XXXX` ", 
-        parse_mode='Markdown')
-    
-    bot.send_message(message.chat.id, "Выбери действие:", reply_markup=get_main_menu(is_adm))
+        f"Чтобы стать админом — введи пароль: `XXXX`",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu(False)
+    )
 
+# ==================== Логин админа ====================
+@dp.message(F.text == ADMIN_PASSWORD)
+async def login_admin(message: types.Message):
+    if message.from_user.id not in admin_users:
+        admin_users.add(message.from_user.id)
+        await message.answer("✅ Ты теперь админ!", reply_markup=get_main_menu(True))
+    else:
+        await message.answer("Ты уже в админ-режиме.")
 
-# ==================== ПАРОЛЬ ДЛЯ АДМИНА ====================
-@bot.message_handler(func=lambda m: m.text == ADMIN_PASSWORD and not is_admin(m.from_user.id))
-def login_admin(message):
-    admin_users.add(message.from_user.id)
-    bot.send_message(message.chat.id, "✅ Ты теперь админ! Доступны дополнительные функции.")
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(True))
-
-
-# ==================== ПРЕДЛОЖЕНИЕ ФИЛЬМА ====================
-@bot.message_handler(func=lambda m: m.text == '📽 Предложить фильм')
-def start_suggestion(message):
-    bot.set_state(message.from_user.id, SuggestionStates.waiting_title, message.chat.id)
-    bot.send_message(message.chat.id, "Напиши **название фильма**, который хочешь предложить:")
-
-@bot.message_handler(state=SuggestionStates.waiting_title)
-def get_title(message):
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['title'] = message.text.strip()
-    
-    # Кнопки для категорий
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True, row_width=2)
-    categories = ['Экшен', 'Легендарные', 'Детективы', 'Триллер', 'Одноразовые', 'Драма', 'Комедия', 'Ужасы', 'Другое']
-    markup.add(*categories)
-    
-    bot.set_state(message.from_user.id, SuggestionStates.waiting_category, message.chat.id)
-    bot.send_message(message.chat.id, "Выбери категорию или напиши свою:", reply_markup=markup)
-
-@bot.message_handler(state=SuggestionStates.waiting_category)
-def get_category(message):
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['category'] = message.text.strip()
-    
-    bot.set_state(message.from_user.id, SuggestionStates.waiting_rating, message.chat.id)
-    bot.send_message(message.chat.id, "Твоя оценка фильма (дробная, например 8.7 или 9.0):")
-
-@bot.message_handler(state=SuggestionStates.waiting_rating)
-def get_rating(message):
-    try:
-        rating = float(message.text.replace(',', '.'))
-        with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-            data['rating'] = rating
-    except ValueError:
-        bot.send_message(message.chat.id, "Пожалуйста, введи число (можно с точкой или запятой). Например: 8.5")
+# ==================== Админ-панель ====================
+@dp.message(F.text == "🔧 Админ-панель")
+async def admin_panel(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("У тебя нет прав администратора.")
         return
-    
-    bot.set_state(message.from_user.id, SuggestionStates.waiting_poster, message.chat.id)
-    bot.send_message(message.chat.id, 
-        "Ссылка на постер (опционально).\n"
-        "Можешь пропустить — просто напиши «пропустить» или «-»")
 
-@bot.message_handler(state=SuggestionStates.waiting_poster)
-def get_poster(message):
-    poster = message.text.strip()
-    if poster.lower() in ['пропустить', '-', 'нет', 'н', 'skip']:
-        poster = None
-    
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['poster'] = poster
-    
-    bot.set_state(message.from_user.id, SuggestionStates.waiting_description, message.chat.id)
-    bot.send_message(message.chat.id, 
-        "Твой комментарий / описание фильма (опционально).\n"
-        "Можешь пропустить — напиши «пропустить»")
+    async with aiosqlite.connect('movies.db') as db:
+        async with db.execute(
+            "SELECT id, title, category, rating, suggested_by FROM suggestions WHERE status = 'pending'"
+        ) as cursor:
+            suggestions = await cursor.fetchall()
 
-@bot.message_handler(state=SuggestionStates.waiting_description)
-def save_suggestion(message):
-    description = message.text.strip()
-    if description.lower() in ['пропустить', '-', 'нет', 'н', 'skip']:
-        description = None
-
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        conn = sqlite3.connect('movies.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO suggestions (title, category, rating, poster, description, suggested_by)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (data['title'], data['category'], data['rating'], data['poster'], description, message.from_user.id))
-        conn.commit()
-        conn.close()
-
-    bot.delete_state(message.from_user.id, message.chat.id)
-    bot.send_message(message.chat.id, "✅ Предложение отправлено на модерацию!\nСпасибо!")
-    
-    is_adm = message.from_user.id in admin_users
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(is_adm))
-
-
-# ==================== АДМИН-ПАНЕЛЬ (с красивыми Inline-кнопками) ====================
-@bot.message_handler(func=lambda m: m.text == '🔧 Админ-панель' and is_admin(m.from_user.id))
-def admin_panel(message):
-    bot.delete_state(message.from_user.id, message.chat.id)
-    
-    conn = sqlite3.connect('movies.db')
-    c = conn.cursor()
-    c.execute("SELECT id, title, category, rating, suggested_by FROM suggestions WHERE status = 'pending'")
-    suggestions = c.fetchall()
-    conn.close()
-
-    if suggestions:
+    if not suggestions:
+        await message.answer("✅ Нет новых предложений на модерацию.")
+    else:
         for sug in suggestions:
             sug_id, title, cat, rating, user_id = sug
-            text = f"📌 Предложение #{sug_id}\n" \
-                   f"Название: {title}\n" \
-                   f"Категория: {cat}\n" \
-                   f"Оценка пользователя: {rating}\n" \
-                   f"От: {user_id}"
+            text = f"📌 Предложение #{sug_id}\nНазвание: {title}\nКатегория: {cat}\nОценка: {rating}\nОт: {user_id}"
 
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            markup.add(
-                types.InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{sug_id}"),
-                types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{sug_id}")
-            )
-            bot.send_message(message.chat.id, text, reply_markup=markup)
-    else:
-        bot.send_message(message.chat.id, "✅ Нет новых предложений на модерацию.")
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{sug_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{sug_id}")
+            ]])
+            await message.answer(text, reply_markup=markup)
 
-    # Красивые Inline-кнопки управления админ-режимом
-    control_markup = types.InlineKeyboardMarkup(row_width=2)
-    control_markup.add(
-        types.InlineKeyboardButton("🚪 Выйти из админа", callback_data="admin_logout"),
-        types.InlineKeyboardButton("↩ Вернуться в меню", callback_data="back_to_menu")
-    )
-    
-    bot.send_message(message.chat.id, 
-        "⚙️ Управление админ-режимом:", 
-        reply_markup=control_markup)
-
-    # ==================== ВЫХОД ИЗ АДМИН-РЕЖИМА ====================
-@bot.message_handler(func=lambda m: m.text == '🚪 Выйти из админа')
-def logout_admin(message):
-    if message.from_user.id in admin_users:
-        admin_users.remove(message.from_user.id)
-        bot.send_message(message.chat.id, "🚪 Ты вышел из админ-режима.\nТеперь ты обычный пользователь.")
-    else:
-        bot.send_message(message.chat.id, "Ты и так не в админ-режиме.")
-    
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(False))
+    # Кнопки управления
+    control = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🚪 Выйти из админа", callback_data="admin_logout"),
+        InlineKeyboardButton(text="↩ Вернуться в меню", callback_data="back_to_menu")
+    ]])
+    await message.answer("⚙️ Управление админ-режимом:", reply_markup=control)
 
 
-# ==================== ВЕРНУТЬСЯ В ГЛАВНОЕ МЕНЮ ====================
-@bot.message_handler(func=lambda m: m.text == '↩ Вернуться в главное меню')
-def back_to_menu(message):
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
-
-
-
-        # ==================== ПОСМОТРЕТЬ ФИЛЬМЫ (доступно всем) ====================
-@bot.message_handler(func=lambda m: m.text in ['📋 Посмотреть фильмы', '📋 Мои фильмы'])
-def show_movies(message):
-    bot.delete_state(message.from_user.id, message.chat.id)
-    
-    conn = sqlite3.connect('movies.db')
-    c = conn.cursor()
-    c.execute("""SELECT title, category, rating, description, user_rating, admin_rating 
-                 FROM movies ORDER BY category, title""")
-    films = c.fetchall()
-    conn.close()
-
-    if not films:
-        bot.send_message(message.chat.id, "Пока нет фильмов в коллекции.")
-        bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
-        return
-
-    text = "📚 Коллекция фильмов:\n"
-    current_cat = None
-    for title, cat, avg_rating, desc, user_r, admin_r in films:
-        if cat != current_cat:
-            text += f"\n🔹 {cat}:\n"
-            current_cat = cat
-        
-        text += f"• {title} — {avg_rating:.1f}"
-        if user_r is not None:
-            text += f" (польз: {user_r:.1f})"
-        if admin_r is not None:
-            text += f" | админ: {admin_r:.1f}"
-        text += "\n"
-        
-        if desc:
-            text += f"   ↳ {desc}\n"
-
-    bot.send_message(message.chat.id, text)
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
-
-
-    # ==================== УДАЛЕНИЕ ФИЛЬМА ====================
-
-
-
-@bot.message_handler(func=lambda m: m.text == '🗑 Удалить фильм' and is_admin(m.from_user.id))
-def start_delete(message):
-    bot.delete_state(message.from_user.id, message.chat.id)
-    bot.set_state(message.from_user.id, DeleteStates.waiting_delete_confirm, message.chat.id)
-    
-    conn = sqlite3.connect('movies.db')
-    c = conn.cursor()
-    c.execute("SELECT id, title, category, rating FROM movies ORDER BY category, title")
-    films = c.fetchall()
-    conn.close()
-
-    if not films:
-        bot.send_message(message.chat.id, "Коллекция пуста, удалять нечего.")
-        bot.delete_state(message.from_user.id, message.chat.id)
-        return
-
-    text = "Выбери фильм для удаления (отправь номер):\n\n"
-    for fid, title, cat, rating in films:
-        text += f"{fid}. {title} ({cat}) — {rating}\n"
-
-    bot.send_message(message.chat.id, text)
-
-@bot.message_handler(state=DeleteStates.waiting_delete_confirm)
-def confirm_delete(message):
-    try:
-        film_id = int(message.text.strip())
-        conn = sqlite3.connect('movies.db')
-        c = conn.cursor()
-        c.execute("DELETE FROM movies WHERE id = ?", (film_id,))
-        deleted = c.rowcount
-        conn.commit()
-        conn.close()
-
-        if deleted > 0:
-            bot.send_message(message.chat.id, f"✅ Фильм с ID {film_id} успешно удалён.")
-        else:
-            bot.send_message(message.chat.id, "❌ Фильм с таким ID не найден.")
-    except ValueError:
-        bot.send_message(message.chat.id, "Пожалуйста, введи число (ID фильма).")
-
-    bot.delete_state(message.from_user.id, message.chat.id)
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(True))
-
-    # ==================== CALLBACK (одобрить / отклонить) ====================
-        # Обработка нажатий на кнопки
-# ==================== ОБРАБОТКА INLINE-КНОПОК ====================
-@bot.callback_query_handler(func=lambda call: True)
-def callback_handler(call):
-    bot.answer_callback_query(call.id)
+    # ==================== Callback обработчик ====================
+@dp.callback_query()
+async def callback_handler(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
 
     if call.data.startswith("approve_"):
         sug_id = int(call.data.split("_")[1])
-        bot.set_state(call.from_user.id, ApproveStates.waiting_final_rating, call.message.chat.id)
-        with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
-            data['approve_id'] = sug_id
-        bot.send_message(call.message.chat.id, f"Одобряем предложение #{sug_id}.\nТвоя финальная оценка (дробная):")
+        await state.set_state(ApproveStates.waiting_final_rating)
+        await state.update_data(approve_id=sug_id)
+        await call.message.answer(f"Одобряем предложение #{sug_id}.\nТвоя финальная оценка (дробная):")
 
     elif call.data.startswith("reject_"):
         sug_id = int(call.data.split("_")[1])
-        conn = sqlite3.connect('movies.db')
-        c = conn.cursor()
-        c.execute("UPDATE suggestions SET status='rejected' WHERE id=?", (sug_id,))
-        conn.commit()
-        conn.close()
-        bot.send_message(call.message.chat.id, f"❌ Предложение #{sug_id} отклонено.")
+        async with aiosqlite.connect('movies.db') as db:
+            await db.execute("UPDATE suggestions SET status='rejected' WHERE id=?", (sug_id,))
+            await db.commit()
+        await call.message.answer(f"❌ Предложение #{sug_id} отклонено.")
 
     elif call.data == "admin_logout":
         if call.from_user.id in admin_users:
             admin_users.remove(call.from_user.id)
-            bot.send_message(call.message.chat.id, "🚪 Ты вышел из админ-режима.\nТеперь ты обычный пользователь.")
-        bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=get_main_menu(False))
+            await call.message.answer("🚪 Ты вышел из админ-режима.")
+        await call.message.answer("Главное меню:", reply_markup=get_main_menu(False))
 
     elif call.data == "back_to_menu":
-        bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=get_main_menu(is_admin(call.from_user.id)))
+        await call.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin(call.from_user.id)))
 
-# ==================== ОДОБРЕНИЕ: оценка админа (теперь отдельно) ====================
-@bot.message_handler(state=ApproveStates.waiting_final_rating)
-def get_final_rating(message):
+
+# ==================== Одобрение фильма ====================
+@dp.message(ApproveStates.waiting_final_rating)
+async def get_final_rating(message: types.Message, state: FSMContext):
     try:
-        admin_rating = float(message.text.replace(',', '.'))
+        rating = float(message.text.replace(',', '.'))
+        await state.update_data(admin_rating=rating)
     except ValueError:
-        admin_rating = None  # можно пропустить
+        await message.answer("Введи число, например 8.7")
+        return
+    await state.set_state(ApproveStates.waiting_final_description)
+    await message.answer("Твой комментарий к фильму (или «пропустить»):")
 
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['admin_rating'] = admin_rating
-        data['final_rating'] = admin_rating  # для совместимости со старым кодом
-    
-    bot.set_state(message.from_user.id, ApproveStates.waiting_final_description, message.chat.id)
-    bot.send_message(message.chat.id, "Твой комментарий (или «пропустить»):")
-
-
-@bot.message_handler(state=ApproveStates.waiting_final_description)
-def save_approved_movie(message):
+@dp.message(ApproveStates.waiting_final_description)
+async def save_approved_movie(message: types.Message, state: FSMContext):
+    data = await state.get_data()
     desc = None if message.text.lower() in ['пропустить', '-', 'нет', 'skip'] else message.text.strip()
-    
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        sug_id = data.get('approve_id')
-        admin_rating = data.get('admin_rating')
+    sug_id = data.get('approve_id')
+    admin_rating = data.get('admin_rating')
 
-        conn = sqlite3.connect('movies.db')
-        c = conn.cursor()
+    async with aiosqlite.connect('movies.db') as db:
+        async with db.execute(
+            "SELECT title, category, poster, description, suggested_by, rating FROM suggestions WHERE id = ?", 
+            (sug_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
 
-        # Получаем данные предложения
-        c.execute("""SELECT title, category, poster, description, suggested_by, rating 
-                     FROM suggestions WHERE id = ?""", (sug_id,))
-        row = c.fetchone()
-        
-        if not row:
-            bot.send_message(message.chat.id, "Ошибка: предложение не найдено.")
-            conn.close()
-            bot.delete_state(message.from_user.id, message.chat.id)
-            return
+        if row:
+            title, category, poster, old_desc, added_by, user_rating = row
+            final_desc = desc or old_desc
 
-        title, category, poster, old_desc, added_by, user_rating = row
-        final_desc = desc or old_desc
+            # Проверка на дубликат
+            async with db.execute("SELECT id FROM movies WHERE title = ? COLLATE NOCASE", (title,)) as cursor:
+                if await cursor.fetchone():
+                    await message.answer(f"❌ Фильм «{title}» уже есть в коллекции!")
+                    await state.clear()
+                    return
 
-        # Проверка на дубликат по названию
-        c.execute("SELECT id FROM movies WHERE title = ? COLLATE NOCASE", (title,))
-        if c.fetchone():
-            bot.send_message(message.chat.id, 
-                f"❌ Фильм «{title}» уже есть в коллекции!\n"
-                "Повторное добавление запрещено.")
-            conn.close()
-            bot.delete_state(message.from_user.id, message.chat.id)
-            return
+            await db.execute('''
+                INSERT INTO movies 
+                (title, category, rating, poster, description, added_by, user_rating, admin_rating)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (title, category, admin_rating or user_rating, poster, final_desc, added_by, user_rating, admin_rating))
 
-        # Добавляем фильм
-        c.execute('''INSERT INTO movies 
-                     (title, category, rating, poster, description, added_by, user_rating, admin_rating)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (title, category, admin_rating or user_rating, poster, final_desc, 
-                   added_by, user_rating, admin_rating))
-        
-        c.execute("UPDATE suggestions SET status = 'approved' WHERE id = ?", (sug_id,))
-        conn.commit()
-        conn.close()
+            await db.execute("UPDATE suggestions SET status = 'approved' WHERE id = ?", (sug_id,))
+            await db.commit()
 
-    bot.delete_state(message.from_user.id, message.chat.id)
-    bot.send_message(message.chat.id, 
+    await state.clear()
+    await message.answer(
         f"✅ Фильм «{title}» успешно добавлен!\n"
         f"Оценка пользователя: {user_rating}\n"
-        f"Твоя оценка: {admin_rating if admin_rating else 'не указана'}")
-    
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(True))
+        f"Твоя оценка: {admin_rating if admin_rating else 'не указана'}"
+    )
+    await message.answer("Главное меню:", reply_markup=get_main_menu(True))
 
-# ==================== МОИ ФИЛЬМЫ ====================
-@bot.message_handler(func=lambda m: m.text in ['📋 Посмотреть фильмы', '📋 Мои фильмы'])
-def show_movies(message):
-    bot.delete_state(message.from_user.id, message.chat.id)
-    
-    conn = sqlite3.connect('movies.db')
-    c = conn.cursor()
-    c.execute("""SELECT title, category, rating, description, user_rating, admin_rating 
-                 FROM movies ORDER BY category, title""")
-    films = c.fetchall()
-    conn.close()
+# ==================== Просмотр фильмов ====================
+@dp.message(F.text.in_({"📋 Посмотреть фильмы", "📋 Мои фильмы"}))
+async def show_movies(message: types.Message):
+    async with aiosqlite.connect('movies.db') as db:
+        async with db.execute("""
+            SELECT title, category, rating, description, user_rating, admin_rating 
+            FROM movies ORDER BY category, title
+        """) as cursor:
+            films = await cursor.fetchall()
 
     if not films:
-        bot.send_message(message.chat.id, "Пока нет фильмов в коллекции.")
-        bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
+        await message.answer("Пока нет фильмов в коллекции.")
+        await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
         return
 
     text = "📚 Коллекция фильмов:\n"
@@ -506,87 +242,220 @@ def show_movies(message):
         if cat != current_cat:
             text += f"\n🔹 {cat}:\n"
             current_cat = cat
-        
         text += f"• {title} — {avg_rating:.1f}"
         if user_r is not None:
             text += f" (польз: {user_r:.1f})"
         if admin_r is not None:
             text += f" | админ: {admin_r:.1f}"
         text += "\n"
-        
         if desc:
             text += f"   ↳ {desc}\n"
 
-    bot.send_message(message.chat.id, text)
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
+    await message.answer(text)
+    await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
 
-
-    # ==================== СЛУЧАЙНЫЙ ФИЛЬМ ====================
-@bot.message_handler(func=lambda m: m.text == '🎲 Случайный фильм')
-def random_movie(message):
-    bot.delete_state(message.from_user.id, message.chat.id)
-    
-    conn = sqlite3.connect('movies.db')
-    c = conn.cursor()
-    c.execute("""SELECT title, category, rating, description, poster, user_rating, admin_rating 
-                 FROM movies ORDER BY RANDOM() LIMIT 1""")
-    film = c.fetchone()
-    conn.close()
+# ==================== Случайный фильм ====================
+@dp.message(F.text == "🎲 Случайный фильм")
+async def random_movie(message: types.Message):
+    async with aiosqlite.connect('movies.db') as db:
+        async with db.execute("""
+            SELECT title, category, rating, description, poster, user_rating, admin_rating 
+            FROM movies ORDER BY RANDOM() LIMIT 1
+        """) as cursor:
+            film = await cursor.fetchone()
 
     if not film:
-        bot.send_message(message.chat.id, "Коллекция пока пуста. Добавь хотя бы один фильм!")
-        bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
+        await message.answer("Коллекция пока пуста.")
+        await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
         return
 
     title, category, rating, desc, poster, user_r, admin_r = film
 
-    text = f"🎲 Случайный фильм:\n\n" \
-           f"📌 {title}\n" \
-           f"🔹 Категория: {category}\n" \
-           f"⭐ Оценка: {rating:.1f}"
-    
+    text = f"🎲 Случайный фильм:\n\n📌 {title}\n🔹 Категория: {category}\n⭐ Оценка: {rating:.1f}"
     if user_r:
         text += f" (польз: {user_r:.1f})"
     if admin_r:
         text += f" | админ: {admin_r:.1f}"
-    
     if desc:
         text += f"\n\n💬 {desc}"
 
     if poster and poster.startswith("http"):
-        bot.send_photo(message.chat.id, poster, caption=text)
+        await bot.send_photo(message.chat.id, poster, caption=text)
     else:
-        bot.send_message(message.chat.id, text)
+        await message.answer(text)
 
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
+    await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
+
+# ==================== Удаление фильма ====================
+@dp.message(F.text == "🗑 Удалить фильм")
+async def start_delete(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("Доступно только админу.")
+        return
+
+    async with aiosqlite.connect('movies.db') as db:
+        async with db.execute("SELECT id, title, category, rating FROM movies ORDER BY category, title") as cursor:
+            films = await cursor.fetchall()
+
+    if not films:
+        await message.answer("Коллекция пуста.")
+        await state.clear()
+        return
+
+    text = "Выбери ID фильма для удаления:\n\n"
+    for fid, title, cat, rating in films:
+        text += f"{fid}. {title} ({cat}) — {rating}\n"
+
+    await state.set_state(DeleteStates.waiting_delete_confirm)
+    await message.answer(text)
+
+@dp.message(DeleteStates.waiting_delete_confirm)
+async def confirm_delete(message: types.Message, state: FSMContext):
+    try:
+        film_id = int(message.text.strip())
+        async with aiosqlite.connect('movies.db') as db:
+            await db.execute("DELETE FROM movies WHERE id = ?", (film_id,))
+            deleted = db.rowcount if hasattr(db, 'rowcount') else 1
+            await db.commit()
+        await message.answer(f"✅ Фильм с ID {film_id} удалён.")
+    except ValueError:
+        await message.answer("Введи число (ID фильма).")
+    except Exception:
+        await message.answer("Фильм не найден.")
+
+    await state.clear()
+    await message.answer("Главное меню:", reply_markup=get_main_menu(True))
+
+# ==================== Предложить фильм ====================
+@dp.message(F.text == "📽 Предложить фильм")
+async def start_suggestion(message: types.Message, state: FSMContext):
+    await state.set_state(SuggestionStates.waiting_title)
+    await message.answer("Напиши **название фильма**, который хочешь предложить:")
+
+@dp.message(SuggestionStates.waiting_title)
+async def get_title(message: types.Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    categories = ['Экшен', 'Легендарные', 'Детективы', 'Триллер', 'Одноразовые', 'Драма', 'Комедия', 'Ужасы', 'Другое']
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=c)] for c in categories],
+        resize_keyboard=True, one_time_keyboard=True
+    )
+    await state.set_state(SuggestionStates.waiting_category)
+    await message.answer("Выбери категорию или напиши свою:", reply_markup=kb)
+
+@dp.message(SuggestionStates.waiting_category)
+async def get_category(message: types.Message, state: FSMContext):
+    await state.update_data(category=message.text.strip())
+    await state.set_state(SuggestionStates.waiting_rating)
+    await message.answer("Твоя оценка фильма (дробная, например 8.7):")
+
+@dp.message(SuggestionStates.waiting_rating)
+async def get_rating(message: types.Message, state: FSMContext):
+    try:
+        rating = float(message.text.replace(',', '.'))
+        await state.update_data(rating=rating)
+    except ValueError:
+        await message.answer("Пожалуйста, введи число. Например: 8.5")
+        return
+    await state.set_state(SuggestionStates.waiting_poster)
+    await message.answer("Ссылка на постер (опционально).\nНапиши «пропустить», если нет.")
+
+@dp.message(SuggestionStates.waiting_poster)
+async def get_poster(message: types.Message, state: FSMContext):
+    poster = None if message.text.lower() in ['пропустить', '-', 'нет', 'skip'] else message.text.strip()
+    await state.update_data(poster=poster)
+    await state.set_state(SuggestionStates.waiting_description)
+    await message.answer("Твой комментарий / описание (опционально).\nНапиши «пропустить», если не нужно.")
+
+@dp.message(SuggestionStates.waiting_description)
+async def save_suggestion(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    desc = None if message.text.lower() in ['пропустить', '-', 'нет', 'skip'] else message.text.strip()
+
+    async with aiosqlite.connect('movies.db') as db:
+        await db.execute('''
+            INSERT INTO suggestions (title, category, rating, poster, description, suggested_by)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (data['title'], data['category'], data['rating'], data['poster'], desc, message.from_user.id))
+        await db.commit()
+
+    await state.clear()
+    await message.answer("✅ Предложение отправлено на модерацию!")
+    await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
+
+# ==================== Админ-панель ====================
+@dp.message(F.text == "🔧 Админ-панель")
+async def admin_panel(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("У тебя нет прав администратора.")
+        return
+
+    async with aiosqlite.connect('movies.db') as db:
+        async with db.execute(
+            "SELECT id, title, category, rating, suggested_by FROM suggestions WHERE status = 'pending'"
+        ) as cursor:
+            suggestions = await cursor.fetchall()
+
+    if not suggestions:
+        await message.answer("✅ Нет новых предложений на модерацию.")
+    else:
+        for sug in suggestions:
+            sug_id, title, cat, rating, user_id = sug
+            text = f"📌 Предложение #{sug_id}\nНазвание: {title}\nКатегория: {cat}\nОценка: {rating}\nОт: {user_id}"
+
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{sug_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{sug_id}")
+            ]])
+            await message.answer(text, reply_markup=markup)
+
+    # Кнопки управления админ-режимом
+    control = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🚪 Выйти из админа", callback_data="admin_logout"),
+        InlineKeyboardButton(text="↩ Вернуться в меню", callback_data="back_to_menu")
+    ]])
+    await message.answer("⚙️ Управление админ-режимом:", reply_markup=control)
+
+# ==================== Callback ====================
+@dp.callback_query()
+async def callback_handler(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+
+    if call.data.startswith("approve_"):
+        sug_id = int(call.data.split("_")[1])
+        await state.set_state(ApproveStates.waiting_final_rating)
+        await state.update_data(approve_id=sug_id)
+        await call.message.answer(f"Одобряем предложение #{sug_id}.\nТвоя финальная оценка (дробная):")
+
+    elif call.data.startswith("reject_"):
+        sug_id = int(call.data.split("_")[1])
+        async with aiosqlite.connect('movies.db') as db:
+            await db.execute("UPDATE suggestions SET status='rejected' WHERE id=?", (sug_id,))
+            await db.commit()
+        await call.message.answer(f"❌ Предложение #{sug_id} отклонено.")
+
+    elif call.data == "admin_logout":
+        if call.from_user.id in admin_users:
+            admin_users.remove(call.from_user.id)
+            await call.message.answer("🚪 Ты вышел из админ-режима.")
+        await call.message.answer("Главное меню:", reply_markup=get_main_menu(False))
+
+    elif call.data == "back_to_menu":
+        await call.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin(call.from_user.id)))
 
 
-    # ==================== ВЫХОД ИЗ АДМИН-РЕЖИМА ====================
-    @bot.message_handler(func=lambda m: m.text == '🚪 Выйти из админ-режима')
-    def logout_admin(message):
-        if message.from_user.id in admin_users:
-            admin_users.remove(message.from_user.id)
-            bot.send_message(message.chat.id, "🚪 Ты успешно вышел из админ-режима.\nТеперь ты обычный пользователь.")
-        else:
-            bot.send_message(message.chat.id, "Ты и так не в админ-режиме.")
-        
-        bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(False))
+# ==================== Реакция на незнакомые команды ====================
+@dp.message()
+async def unknown_command(message: types.Message):
+    await message.answer("Я тебя не понимаю. Нажми /start, чтобы открыть меню.")
 
 
-    @bot.message_handler(commands=['exit', 'logout'])
-    def exit_command(message):
-        if message.from_user.id in admin_users:
-            admin_users.remove(message.from_user.id)
-            bot.send_message(message.chat.id, "🚪 Ты успешно вышел из админ-режима.")
-        else:
-            bot.send_message(message.chat.id, "Ты и так не в админ-режиме.")
-        
-        bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_menu(False))
 
-@bot.message_handler(func=lambda message: True)
-def unknown_command(message):
-    bot.send_message(message.chat.id, "Я тебя не понимаю. Нажми /start, чтобы открыть меню.")
+# ==================== Запуск ====================
+async def main():
+    await init_db()
+    print("✅ Бот на aiogram успешно запущен!")
+    await dp.start_polling(bot)
 
-
-print("Бот запущен — Этап 6.5 (Админ Панель)")
-bot.infinity_polling(none_stop=True, interval=1)
+if __name__ == "__main__":
+    asyncio.run(main())
