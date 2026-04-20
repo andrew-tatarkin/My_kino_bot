@@ -40,7 +40,7 @@ print("✅ Бот инициализирован успешно")
 
 # ==================== Запуск ====================
 if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 10000))
+    port = int(os.environ.get('PORT', 10000))sssssss
     print(f"🌐 Запуск Flask healthcheck на порту {port}")
     
     # Запускаем Flask в отдельном потоке
@@ -52,7 +52,7 @@ if __name__ == "__main__":
     print("🤖 Запуск Telegram бота... ")
     bot.infinity_polling(none_stop=True, interval=1, timeout=20)
 
-# ==================== СОСТОЯНИЯ (FSM) ====================
+# ==================== СОСТОЯНИЯ (FSM) =================== =
 class SuggestionStates(StatesGroup):
     waiting_title = State()
     waiting_category = State()
