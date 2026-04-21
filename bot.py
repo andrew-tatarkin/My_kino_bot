@@ -3,6 +3,8 @@ import logging
 import asyncio
 from dotenv import load_dotenv
 
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -24,6 +26,7 @@ if not TOKEN:
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
 
 logging.basicConfig(level=logging.INFO)
 
@@ -70,7 +73,7 @@ class ApproveStates(StatesGroup):
     waiting_final_description = State()
 
 class DeleteStates(StatesGroup):
-    waiting_delete_confirm = State()
+    waiting_search_query = State()  # Ожидание поискового запроса
 
 # ==================== Главное меню ====================
 def get_main_menu(is_admin: bool = False):
@@ -139,8 +142,14 @@ async def admin_panel(message: types.Message):
     await message.answer("⚙️ Управление админ-режимом:", reply_markup=control)
 
 
-    # ==================== Callback обработчик ====================
-@dp.callback_query()
+
+# ==================== Callback обработчик (с уведомлением пользователя) ====================
+@dp.callback_query(
+    F.data.startswith("approve_") |
+    F.data.startswith("reject_") |
+    (F.data == "admin_logout") |
+    (F.data == "back_to_menu")
+)
 async def callback_handler(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
 
@@ -152,9 +161,23 @@ async def callback_handler(call: types.CallbackQuery, state: FSMContext):
 
     elif call.data.startswith("reject_"):
         sug_id = int(call.data.split("_")[1])
+        
+        # Получаем название фильма для уведомления пользователя
+        async with aiosqlite.connect('movies.db') as db:
+            async with db.execute("SELECT title, suggested_by FROM suggestions WHERE id = ?", (sug_id,)) as cursor:
+                row = await cursor.fetchone()
+        
+        if row:
+            title, suggested_by = row
+            await bot.send_message(
+                suggested_by, 
+                f"❌ Ваш фильм «{title}» был отклонён администратором."
+            )
+
         async with aiosqlite.connect('movies.db') as db:
             await db.execute("UPDATE suggestions SET status='rejected' WHERE id=?", (sug_id,))
             await db.commit()
+
         await call.message.answer(f"❌ Предложение #{sug_id} отклонено.")
 
     elif call.data == "admin_logout":
@@ -166,8 +189,19 @@ async def callback_handler(call: types.CallbackQuery, state: FSMContext):
     elif call.data == "back_to_menu":
         await call.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin(call.from_user.id)))
 
-
 # ==================== Одобрение фильма ====================
+@dp.message(ApproveStates.waiting_final_rating)
+async def get_final_rating(message: types.Message, state: FSMContext):
+    try:
+        rating = float(message.text.replace(',', '.'))
+        await state.update_data(admin_rating=rating)
+    except ValueError:
+        await message.answer("Введи число, например 8.7")
+        return
+    await state.set_state(ApproveStates.waiting_final_description)
+    await message.answer("Твой комментарий к фильму (или «пропустить»):")
+
+# ==================== Одобрение фильма с уведомлением пользователя ====================
 @dp.message(ApproveStates.waiting_final_rating)
 async def get_final_rating(message: types.Message, state: FSMContext):
     try:
@@ -204,6 +238,7 @@ async def save_approved_movie(message: types.Message, state: FSMContext):
                     await state.clear()
                     return
 
+            # Добавляем фильм
             await db.execute('''
                 INSERT INTO movies 
                 (title, category, rating, poster, description, added_by, user_rating, admin_rating)
@@ -212,6 +247,13 @@ async def save_approved_movie(message: types.Message, state: FSMContext):
 
             await db.execute("UPDATE suggestions SET status = 'approved' WHERE id = ?", (sug_id,))
             await db.commit()
+
+            # Уведомляем пользователя, что фильм принят
+            await bot.send_message(
+                added_by,
+                f"✅ Ваш фильм «{title}» был принят администратором!\n"
+                f"Оценка администратора: {admin_rating if admin_rating else 'не указана'}"
+            )
 
     await state.clear()
     await message.answer(
@@ -286,45 +328,110 @@ async def random_movie(message: types.Message):
 
     await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin(message.from_user.id)))
 
-# ==================== Удаление фильма ====================
+    
+# ==================== УДАЛЕНИЕ ФИЛЬМОВ ====================
+
 @dp.message(F.text == "🗑 Удалить фильм")
 async def start_delete(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("Доступно только админу.")
         return
 
+    await state.set_state(DeleteStates.waiting_search_query)
+    await message.answer(
+        "Введите название фильма или напишите «все» для полного списка:\n"
+        "Напишите «отмена», чтобы выйти."
+    )
+
+
+@dp.message(DeleteStates.waiting_search_query)
+async def process_search(message: types.Message, state: FSMContext):
+    if message.text.lower() in ['отмена', 'назад', 'выход']:
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=get_main_menu(True))
+        return
+
+    query = message.text.strip().lower()
+
     async with aiosqlite.connect('movies.db') as db:
-        async with db.execute("SELECT id, title, category, rating FROM movies ORDER BY category, title") as cursor:
+        if query == "все":
+            sql = "SELECT id, title, category, rating FROM movies ORDER BY category, title"
+            params = ()
+        else:
+            sql = "SELECT id, title, category, rating FROM movies WHERE LOWER(title) LIKE ? ORDER BY title"
+            params = (f"%{query}%",)
+
+        async with db.execute(sql, params) as cursor:
             films = await cursor.fetchall()
 
     if not films:
-        await message.answer("Коллекция пуста.")
+        await message.answer("Ничего не найдено. Попробуйте другое название или «отмена».")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for fid, title, cat, rating in films[:25]:
+        builder.row(InlineKeyboardButton(
+            text=f"❌ {title} ({cat}) — {rating}",
+            callback_data=f"delete_film:{fid}"
+        ))
+
+    await message.answer(
+        f"Найдено {len(films)} фильмов.\nНажмите на фильм для удаления:",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("delete_film:"))
+async def confirm_delete(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    film_id = int(callback.data.split(":")[1])
+
+    async with aiosqlite.connect('movies.db') as db:
+        async with db.execute("SELECT title FROM movies WHERE id = ?", (film_id,)) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await callback.message.edit_text("Фильм уже удалён ранее.")
         await state.clear()
         return
 
-    text = "Выбери ID фильма для удаления:\n\n"
-    for fid, title, cat, rating in films:
-        text += f"{fid}. {title} ({cat}) — {rating}\n"
+    title = row[0]
 
-    await state.set_state(DeleteStates.waiting_delete_confirm)
-    await message.answer(text)
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delete_yes:{film_id}"),
+        InlineKeyboardButton(text="❌ Нет, отменить", callback_data="delete_no")
+    ]])
 
-@dp.message(DeleteStates.waiting_delete_confirm)
-async def confirm_delete(message: types.Message, state: FSMContext):
-    try:
-        film_id = int(message.text.strip())
-        async with aiosqlite.connect('movies.db') as db:
-            await db.execute("DELETE FROM movies WHERE id = ?", (film_id,))
-            deleted = db.rowcount if hasattr(db, 'rowcount') else 1
-            await db.commit()
-        await message.answer(f"✅ Фильм с ID {film_id} удалён.")
-    except ValueError:
-        await message.answer("Введи число (ID фильма).")
-    except Exception:
-        await message.answer("Фильм не найден.")
+    await callback.message.edit_text(
+        f"Вы уверены, что хотите удалить этот фильм?\n\n**{title}**",
+        reply_markup=confirm_kb,
+        parse_mode="Markdown"
+    )
 
+
+@dp.callback_query(F.data.startswith("delete_yes:"))
+async def execute_delete(callback: types.CallbackQuery):
+    await callback.answer()
+    film_id = int(callback.data.split(":")[1])
+
+    async with aiosqlite.connect('movies.db') as db:
+        async with db.execute("SELECT title FROM movies WHERE id = ?", (film_id,)) as cur:
+            row = await cur.fetchone()
+            title = row[0] if row else "Неизвестный фильм"
+
+        await db.execute("DELETE FROM movies WHERE id = ?", (film_id,))
+        await db.commit()
+
+    await callback.message.edit_text(f"✅ Фильм «{title}» успешно удалён.")
+
+
+@dp.callback_query(F.data == "delete_no")
+async def cancel_delete(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.edit_text("❌ Удаление отменено.")
     await state.clear()
-    await message.answer("Главное меню:", reply_markup=get_main_menu(True))
+
 
 # ==================== Предложить фильм ====================
 @dp.message(F.text == "📽 Предложить фильм")
@@ -335,7 +442,7 @@ async def start_suggestion(message: types.Message, state: FSMContext):
 @dp.message(SuggestionStates.waiting_title)
 async def get_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
-    categories = ['Экшен', 'Легендарные', 'Детективы', 'Триллер', 'Одноразовые', 'Драма', 'Комедия', 'Ужасы', 'Другое']
+    categories = ['Экшен', 'Легендарные', 'Детективы', 'Триллер', 'Одноразовые', 'Драма', 'Комедия', 'Ужасы', 'Мультфильмы', 'Другое']
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=c)] for c in categories],
         resize_keyboard=True, one_time_keyboard=True
@@ -353,12 +460,15 @@ async def get_category(message: types.Message, state: FSMContext):
 async def get_rating(message: types.Message, state: FSMContext):
     try:
         rating = float(message.text.replace(',', '.'))
+        if not (0 <= rating <= 10):
+            await message.answer("Оценка должна быть в диапазоне от 0 до 10!")
+        return
         await state.update_data(rating=rating)
     except ValueError:
         await message.answer("Пожалуйста, введи число. Например: 8.5")
         return
     await state.set_state(SuggestionStates.waiting_poster)
-    await message.answer("Ссылка на постер (опционально).\nНапиши «пропустить», если нет.")
+    await message.answer("Ссылка на постер (опционально).\nНапиши «пропустить», если нет.") #333333333333333333333333333333333333333333333333333333333333333333333
 
 @dp.message(SuggestionStates.waiting_poster)
 async def get_poster(message: types.Message, state: FSMContext):
@@ -415,33 +525,6 @@ async def admin_panel(message: types.Message):
         InlineKeyboardButton(text="↩ Вернуться в меню", callback_data="back_to_menu")
     ]])
     await message.answer("⚙️ Управление админ-режимом:", reply_markup=control)
-
-# ==================== Callback ====================
-@dp.callback_query()
-async def callback_handler(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
-
-    if call.data.startswith("approve_"):
-        sug_id = int(call.data.split("_")[1])
-        await state.set_state(ApproveStates.waiting_final_rating)
-        await state.update_data(approve_id=sug_id)
-        await call.message.answer(f"Одобряем предложение #{sug_id}.\nТвоя финальная оценка (дробная):")
-
-    elif call.data.startswith("reject_"):
-        sug_id = int(call.data.split("_")[1])
-        async with aiosqlite.connect('movies.db') as db:
-            await db.execute("UPDATE suggestions SET status='rejected' WHERE id=?", (sug_id,))
-            await db.commit()
-        await call.message.answer(f"❌ Предложение #{sug_id} отклонено.")
-
-    elif call.data == "admin_logout":
-        if call.from_user.id in admin_users:
-            admin_users.remove(call.from_user.id)
-            await call.message.answer("🚪 Ты вышел из админ-режима.")
-        await call.message.answer("Главное меню:", reply_markup=get_main_menu(False))
-
-    elif call.data == "back_to_menu":
-        await call.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin(call.from_user.id)))
 
 
 # ==================== Реакция на незнакомые команды ====================
